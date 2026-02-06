@@ -18302,6 +18302,33 @@ func (c *Checker) findResolutionCycleStartIndex(target TypeSystemEntity, propert
 	return -1
 }
 
+// isTypeAliasBeingResolved checks if a type alias symbol is currently being resolved
+// (i.e., it's on the resolution stack but declaredType hasn't been set yet)
+func (c *Checker) isTypeAliasBeingResolved(symbol *ast.Symbol) bool {
+	links := c.typeAliasLinks.Get(symbol)
+	if links.declaredType != nil {
+		return false
+	}
+	// Check if symbol is on the resolution stack
+	for i := len(c.typeResolutions) - 1; i >= c.resolutionStart; i-- {
+		resolution := &c.typeResolutions[i]
+		if resolution.propertyName == TypeSystemPropertyNameDeclaredType && 
+		   resolution.target == symbol {
+			return true
+		}
+	}
+	return false
+}
+
+// isNodeDescendantOf checks if a node is a descendant of another node in the AST
+func (c *Checker) isNodeDescendantOf(node *ast.Node, ancestor *ast.Node) bool {
+	current := node
+	for current != nil && current != ancestor {
+		current = current.Parent
+	}
+	return current == ancestor
+}
+
 func (c *Checker) typeResolutionHasProperty(r *TypeResolution) bool {
 	switch r.propertyName {
 	case TypeSystemPropertyNameType:
@@ -23023,6 +23050,33 @@ func (c *Checker) getTypeFromTypeAliasReference(node *ast.Node, symbol *ast.Symb
 		}
 		return errorType
 	}
+	
+	// Check if this is a self-referential type alias with type arguments in a deferred context.
+	// Generic type aliases can reference themselves safely when the reference appears in a 
+	// conditionally-evaluated context (e.g., conditional type branch) but not in direct contexts
+	// (e.g., union/intersection). We check if the reference is in a conditional type's branch.
+	localTypeParams := c.getLocalTypeParametersOfClassOrInterfaceOrTypeAlias(symbol)
+	if len(localTypeParams) > 0 && len(typeArguments) > 0 && c.isTypeAliasBeingResolved(symbol) {
+		// Check if this node is in a conditional type's true or false branch (deferred evaluation)
+		parent := node.Parent
+		for parent != nil {
+			if parent.Kind == ast.KindConditionalType {
+				condNode := parent.AsConditionalTypeNode()
+				// Check if our node is in the true or false branch (not in check/extends types)
+				if c.isNodeDescendantOf(node, condNode.TrueType) || c.isNodeDescendantOf(node, condNode.FalseType) {
+					// In conditional branch - safe to defer
+					return c.wildcardType
+				}
+				// In check/extends type - not deferred, continue checking parents
+			}
+			// Stop at type alias boundary - don't look beyond the declaring type alias
+			if isTypeAlias(parent) {
+				break
+			}
+			parent = parent.Parent
+		}
+	}
+	
 	t := c.getDeclaredTypeOfSymbol(symbol)
 	typeParameters := c.typeAliasLinks.Get(symbol).typeParameters
 	if len(typeParameters) != 0 {
@@ -23072,6 +23126,15 @@ func (c *Checker) getTypeFromTypeAliasReference(node *ast.Node, symbol *ast.Symb
 }
 
 func (c *Checker) getTypeAliasInstantiation(symbol *ast.Symbol, typeArguments []*Type, alias *TypeAlias) *Type {
+	// Special handling: If this type alias is currently being resolved (i.e., we're in the middle
+	// of resolving its declared type), we can't instantiate it yet. Instead, return the wildcard type
+	// which will defer the instantiation until the declared type is available.
+	// This prevents false circular reference errors when a generic type alias references itself
+	// with type arguments during its own resolution (e.g., type T<X> = Foo<T<X>>).
+	if c.isTypeAliasBeingResolved(symbol) {
+		return c.wildcardType
+	}
+	
 	t := c.getDeclaredTypeOfSymbol(symbol)
 	if t == c.intrinsicMarkerType {
 		if typeKind, ok := intrinsicTypeKinds[symbol.Name]; ok && len(typeArguments) == 1 {
